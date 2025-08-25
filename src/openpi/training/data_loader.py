@@ -146,6 +146,16 @@ def create_torch_dataset(
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+    
+    # Wrap with NextActionDataset for predictive models
+    # Check if model type indicates predictive or obs distilled model
+    if hasattr(model_config, 'model_type'):
+        from openpi.models import model as _model
+        if model_config.model_type in [_model.ModelType.PI0_FAST]:
+            # Check if this is a predictive config by looking for specific attributes
+            if hasattr(model_config, 'use_current_action_input') or hasattr(model_config, 'use_prev_action_input'):
+                from openpi.data.next_action_dataset import NextActionDataset
+                dataset = NextActionDataset(dataset)
 
     return dataset
 

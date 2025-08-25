@@ -1,24 +1,28 @@
 """See _CONFIGS for the list of available configs."""
 
 import abc
-from collections.abc import Sequence
 import dataclasses
 import difflib
 import logging
 import pathlib
+from collections.abc import Sequence
 from typing import Any, Protocol, TypeAlias
 
 import etils.epath as epath
 import flax.nnx as nnx
-from typing_extensions import override
 import tyro
+from typing_extensions import override
 
 import openpi.models.model as _model
 import openpi.models.pi0 as pi0
 import openpi.models.pi0_fast as pi0_fast
+import openpi.models.pi0_fast_obs_distilled as pi0_obs_distilled
+import openpi.models.pi0_fast_predictive as pi0_predictive
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
+import openpi.policies.libero_next_action_policy as libero_next_action_policy
+import openpi.policies.libero_obs_distillation_policy as libero_obs_distillation_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
@@ -172,13 +176,33 @@ class DataConfigFactory(abc.ABC):
     def _load_norm_stats(self, assets_dir: epath.Path, asset_id: str | None) -> dict[str, _transforms.NormStats] | None:
         if asset_id is None:
             return None
+
+        # Try to load norm stats from the current config's assets dir first
         try:
             data_assets_dir = str(assets_dir / asset_id)
             norm_stats = _normalize.load(_download.maybe_download(data_assets_dir))
             logging.info(f"Loaded norm stats from {data_assets_dir}")
             return norm_stats
         except FileNotFoundError:
-            logging.info(f"Norm stats not found in {data_assets_dir}, skipping.")
+            pass
+
+        # If not found, try to find norm stats in any existing config directory for the same dataset
+        # This allows reusing norm stats computed for other configs using the same dataset
+        assets_base = assets_dir.parent if assets_dir.name else assets_dir
+        for existing_config_dir in assets_base.glob("*/"):
+            if existing_config_dir.is_dir():
+                try:
+                    data_assets_dir = str(existing_config_dir / asset_id)
+                    if epath.Path(data_assets_dir).exists():
+                        norm_stats = _normalize.load(_download.maybe_download(data_assets_dir))
+                        logging.info(
+                            f"Reusing norm stats from {data_assets_dir} (computed for {existing_config_dir.name})"
+                        )
+                        return norm_stats
+                except (FileNotFoundError, Exception):
+                    continue
+
+        logging.info(f"Norm stats not found for dataset {asset_id} in any config directory under {assets_base}")
         return None
 
 
@@ -633,6 +657,150 @@ _CONFIGS = [
             action_dim=7, action_horizon=10, max_token_len=180, paligemma_variant="gemma_2b_lora"
         ).get_freeze_filter(),
         # Turn off EMA for LoRA finetuning.
+        ema_decay=None,
+    ),
+    #
+    # Next Action Prediction configs for Libero
+    #
+    TrainConfig(
+        name="pi0_fast_libero_predictive",
+        # Pi0-FAST model configured for next action prediction (o_t, a_t -> a_{t+1})
+        model=pi0_predictive.Pi0FASTPredictiveConfig(
+            action_dim=7,
+            action_horizon=10,
+            max_token_len=180,
+            use_current_action_input=True,
+        ),
+        data=SimpleDataConfig(
+            repo_id="physical-intelligence/libero",
+            data_transforms=lambda model: _transforms.Group(
+                inputs=[
+                    _transforms.NextActionTransform(action_dim=model.action_dim),
+                    libero_next_action_policy.LiberoNextActionInputs(
+                        action_dim=model.action_dim, model_type=model.model_type
+                    ),
+                ],
+                outputs=[libero_next_action_policy.LiberoNextActionOutputs(action_dim=7)],
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
+        num_train_steps=30_000,
+        batch_size=32,
+    ),
+    TrainConfig(
+        name="pi0_fast_libero_predictive_low_mem_finetuning",
+        # LoRA version for lower memory footprint
+        model=pi0_predictive.Pi0FASTPredictiveConfig(
+            action_dim=7,
+            action_horizon=10,
+            max_token_len=180,
+            paligemma_variant="gemma_2b_lora",
+            use_current_action_input=True,
+        ),
+        data=SimpleDataConfig(
+            repo_id="physical-intelligence/libero",
+            data_transforms=lambda model: _transforms.Group(
+                inputs=[
+                    _transforms.NextActionTransform(action_dim=model.action_dim),
+                    libero_next_action_policy.LiberoNextActionInputs(
+                        action_dim=model.action_dim, model_type=model.model_type
+                    ),
+                ],
+                outputs=[libero_next_action_policy.LiberoNextActionOutputs(action_dim=7)],
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
+        num_train_steps=30_000,
+        batch_size=32,
+        freeze_filter=pi0_predictive.Pi0FASTPredictiveConfig(
+            action_dim=7, action_horizon=10, max_token_len=180, paligemma_variant="gemma_2b_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    #
+    # Observation Distillation configs for Libero
+    #
+    TrainConfig(
+        name="pi0_fast_libero_obs_distilled",
+        # Pi0-FAST with KL distillation: student(o_{t-1}, a_{t-1}) → a_t, teacher(o_t) → a_t
+        model=pi0_obs_distilled.Pi0FASTObsDistilledConfig(
+            action_dim=7,
+            action_horizon=10,
+            max_token_len=180,
+            use_prev_action_input=True,
+            use_teacher_model=True,
+            kl_weight=1.0,
+            teacher_temperature=1.0,
+            # Teacher checkpoint can be specified here
+            teacher_checkpoint=None,  # Will use randomly initialized teacher for testing
+        ),
+        data=SimpleDataConfig(
+            repo_id="physical-intelligence/libero",
+            data_transforms=lambda model: _transforms.Group(
+                inputs=[
+                    libero_obs_distillation_policy.ObservationDistillationTransform(
+                        action_dim=model.action_dim,
+                        handle_first_timestep="duplicate",
+                    ),
+                    libero_obs_distillation_policy.LiberoObsDistillationInputs(
+                        action_dim=model.action_dim,
+                        model_type=model.model_type,
+                    ),
+                ],
+                outputs=[libero_obs_distillation_policy.LiberoObsDistillationOutputs(action_dim=7)],
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
+        num_train_steps=30_000,
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+        ),
+    ),
+    TrainConfig(
+        name="pi0_fast_libero_obs_distilled_low_mem_finetuning",
+        # LoRA version for lower memory footprint
+        model=pi0_obs_distilled.Pi0FASTObsDistilledConfig(
+            action_dim=7,
+            action_horizon=10,
+            max_token_len=180,
+            paligemma_variant="gemma_2b_lora",
+            use_prev_action_input=True,
+            use_teacher_model=True,  # Enable self-distillation
+            kl_weight=0.5,  # Lower KL weight for LoRA finetuning
+            teacher_temperature=2.0,  # Higher temperature for softer targets
+            teacher_checkpoint=None,  # None means self-distillation
+        ),
+        data=SimpleDataConfig(
+            repo_id="physical-intelligence/libero",
+            data_transforms=lambda model: _transforms.Group(
+                inputs=[
+                    libero_obs_distillation_policy.ObservationDistillationTransform(
+                        action_dim=model.action_dim,
+                        handle_first_timestep="duplicate",
+                    ),
+                    libero_obs_distillation_policy.LiberoObsDistillationInputs(
+                        action_dim=model.action_dim,
+                        model_type=model.model_type,
+                    ),
+                ],
+                outputs=[libero_obs_distillation_policy.LiberoObsDistillationOutputs(action_dim=7)],
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/mnt/ssd1/min99830/openpi/checkpoints/pi0_fast_libero_low_mem_finetune/pi0_fast_libero_baseline_lora_20250823_063853/29999/params"
+        ),  # This should be the path to trained pi0_fast model finetuned on libero.
+        num_train_steps=30_000,
+        batch_size=32,
+        freeze_filter=pi0_obs_distilled.Pi0FASTObsDistilledConfig(
+            action_dim=7, action_horizon=10, max_token_len=180, paligemma_variant="gemma_2b_lora"
+        ).get_freeze_filter(),
         ema_decay=None,
     ),
     #

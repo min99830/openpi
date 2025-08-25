@@ -431,3 +431,186 @@ def _assert_quantile_stats(norm_stats: at.PyTree[NormStats]) -> None:
             raise ValueError(
                 f"quantile stats must be provided if use_quantile_norm is True. Key {k} is missing q01 or q99."
             )
+
+
+# Next Action Prediction Transforms
+
+
+@dataclasses.dataclass(frozen=True)
+class NextActionTransform(DataTransformFn):
+    """Transform that creates targets for next action horizon prediction.
+    
+    For predictive models that learn (o_t, a_t[horizon]) -> a_{t+1}[horizon], this transform:
+    1. Stores the current action horizon as 'current_actions' (for input)
+    2. For training with LeRobot datasets, expects consecutive samples where 
+       sample[i+1] contains the next action horizon we want to predict
+    3. During inference or when next sample unavailable, shifts within the horizon
+    
+    Note: For proper next horizon prediction during training, use a custom dataloader
+    that provides 'next_actions' from the consecutive sample.
+    """
+
+    action_dim: int
+    handle_last_timestep: str = "duplicate"  # Options: "duplicate", "zero", "mask"
+
+    def __call__(self, data: dict) -> dict:
+        """Transform data to include current and next action horizons.
+        
+        Args:
+            data: Dictionary containing:
+                - actions: Current action horizon [horizon, action_dim] or [batch, horizon, action_dim]
+                - next_actions (optional): Next action horizon from dataset for proper training
+                - Other observation data (images, state, etc.)
+
+        Returns:
+            Modified data dictionary with:
+                - current_actions: The current action horizon (for input)
+                - actions: The next action horizon (for target)
+                - next_action_mask: Boolean mask indicating valid next actions
+        """
+        result = data.copy()
+
+        if "actions" not in data:
+            # During inference, no actions to transform
+            return result
+
+        actions = np.asarray(data["actions"])
+
+        # Handle different action shapes
+        if actions.ndim == 2:
+            # Could be [batch_size, action_dim] or [horizon, action_dim]
+            # Check if second dimension matches action_dim
+            if actions.shape[1] == self.action_dim:
+                # Likely [horizon, action_dim] for single sample
+                # or [batch_size, action_dim] for single timestep
+                
+                # Check if we have the true next action horizon from dataset
+                if "next_actions" in data:
+                    # We have the proper next action horizon for training
+                    result["current_actions"] = actions.copy()
+                    result["actions"] = np.asarray(data["next_actions"])
+                    result["next_action_mask"] = np.ones(result["actions"].shape[0], dtype=bool)
+                # If first dimension is small and looks like horizon, treat as trajectory
+                elif actions.shape[0] > 1 and actions.shape[0] <= 20:  # Assume horizon <= 20
+                    # Treat as [horizon, action_dim]
+                    horizon = actions.shape[0]
+                    
+                    # Current actions: a_t to a_{t+H-1}
+                    result["current_actions"] = actions.copy()
+                    
+                    # For inference or when next sample unavailable, shift within horizon
+                    # Note: This is not ideal for training - use next_actions from dataset instead
+                    next_actions = np.zeros_like(actions)
+                    next_actions[:-1] = actions[1:]  # Shift by one timestep
+                    
+                    # Handle the last timestep
+                    if self.handle_last_timestep == "duplicate":
+                        next_actions[-1] = actions[-1]
+                    elif self.handle_last_timestep == "zero":
+                        next_actions[-1] = 0
+                    
+                    result["actions"] = next_actions
+                    
+                    # Create mask for valid next actions
+                    mask = np.ones(horizon, dtype=bool)
+                    if self.handle_last_timestep in ["zero", "mask"]:
+                        mask[-1] = False
+                    result["next_action_mask"] = mask
+                else:
+                    # Treat as [batch_size, action_dim] for single timestep
+                    batch_size = actions.shape[0]
+                    
+                    # Store current action as input
+                    result["current_actions"] = actions.copy()
+                    
+                    # For single timestep, we can't shift - just duplicate or zero
+                    if self.handle_last_timestep == "duplicate":
+                        result["actions"] = actions.copy()
+                        result["next_action_mask"] = np.ones(batch_size, dtype=bool)
+                    elif self.handle_last_timestep == "zero":
+                        result["actions"] = np.zeros_like(actions)
+                        result["next_action_mask"] = np.zeros(batch_size, dtype=bool)
+                    else:
+                        result["actions"] = actions.copy()
+                        result["next_action_mask"] = np.ones(batch_size, dtype=bool)
+            else:
+                raise ValueError(f"Unexpected action dimensions: {actions.shape}")
+
+        elif actions.ndim == 3:
+            # Shape: [batch_size, horizon, action_dim]
+            # This is for multi-step/chunked prediction
+            batch_size, horizon, _ = actions.shape
+
+            # Current actions: a_t to a_{t+H-1}
+            result["current_actions"] = actions.copy()
+
+            # Next actions: a_{t+1} to a_{t+H}
+            next_actions = np.zeros_like(actions)
+            next_actions[:, :-1] = actions[:, 1:]  # Shift by one timestep
+
+            # Handle the last timestep in the horizon
+            if self.handle_last_timestep == "duplicate":
+                next_actions[:, -1] = actions[:, -1]
+            elif self.handle_last_timestep == "zero":
+                next_actions[:, -1] = 0
+            # else: already zeros from initialization
+
+            result["actions"] = next_actions
+
+            # Create mask for valid next actions
+            mask = np.ones((batch_size, horizon), dtype=bool)
+            if self.handle_last_timestep in ["zero", "mask"]:
+                mask[:, -1] = False
+            result["next_action_mask"] = mask
+
+        else:
+            raise ValueError(f"Unexpected action shape: {actions.shape}")
+
+        return result
+
+
+@dataclasses.dataclass(frozen=True)
+class NextActionDataLoader(DataTransformFn):
+    """Extended data loader that properly handles trajectory boundaries for next action prediction.
+
+    This loader ensures that when loading from a dataset, we properly get a_{t+1}
+    from the next timestep in the trajectory.
+    """
+
+    action_dim: int
+
+    def __call__(self, data: dict, trajectory_data: dict | None = None) -> dict:
+        """Process data with access to full trajectory for proper next action loading.
+
+        Args:
+            data: Current timestep data
+            trajectory_data: Full trajectory data (if available from dataset)
+
+        Returns:
+            Modified data with current and next actions properly set
+        """
+        result = data.copy()
+
+        if trajectory_data is not None and "timestep_idx" in data:
+            # We have access to the full trajectory and know current timestep
+            timestep = data["timestep_idx"]
+            trajectory_len = trajectory_data["trajectory_length"]
+
+            # Get current action
+            result["current_actions"] = data["actions"].copy()
+
+            # Get next action if available
+            if timestep < trajectory_len - 1:
+                # Get actual next action from trajectory
+                result["actions"] = trajectory_data["all_actions"][timestep + 1]
+                result["next_action_mask"] = np.True_
+            else:
+                # Last timestep - no next action available
+                result["actions"] = np.zeros((self.action_dim,))
+                result["next_action_mask"] = np.False_
+        else:
+            # Fallback to simple transform
+            transform = NextActionTransform(action_dim=self.action_dim)
+            result = transform(data)
+
+        return result
